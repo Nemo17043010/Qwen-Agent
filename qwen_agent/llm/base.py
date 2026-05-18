@@ -386,7 +386,8 @@ class BaseChatModel(ABC):
     ) -> Iterator[List[Message]]:
         pre_msg = []
         for pre_msg in messages:
-            yield self._postprocess_messages(pre_msg, fncall_mode=fncall_mode, generate_cfg=generate_cfg)
+            post_msg = self._postprocess_messages(pre_msg, fncall_mode=fncall_mode, generate_cfg=generate_cfg)
+            yield post_msg
         logger.debug(f'LLM Output: \n{pformat([_.model_dump() for _ in pre_msg], indent=2)}')
 
     def _convert_messages_to_target_type(self, messages: List[Message],
@@ -833,6 +834,7 @@ def retry_model_service_iterator(
             break
 
         except ModelServiceError as e:
+            logger.warning(f'[LLM stream] retry #{num_retries + 1} due to: {e}')
             num_retries, delay = _raise_or_delay(e, num_retries, delay, max_retries)
 
 

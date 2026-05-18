@@ -18,6 +18,7 @@ from typing import Dict, Iterator, List, Literal, Optional, Union
 from qwen_agent import Agent
 from qwen_agent.llm import BaseChatModel
 from qwen_agent.llm.schema import DEFAULT_SYSTEM_MESSAGE, FUNCTION, Message
+from qwen_agent.log import logger
 from qwen_agent.memory import Memory
 from qwen_agent.settings import MAX_LLM_CALL_PER_RUN
 from qwen_agent.tools import BaseTool
@@ -77,6 +78,9 @@ class FnCallAgent(Agent):
         while True and num_llm_calls_available > 0:
             num_llm_calls_available -= 1
 
+            llm_call_num = MAX_LLM_CALL_PER_RUN - num_llm_calls_available
+            logger.info(f'[FnCallAgent] === LLM call #{llm_call_num} ===')
+
             extra_generate_cfg = {'lang': lang}
             if kwargs.get('seed') is not None:
                 extra_generate_cfg['seed'] = kwargs['seed']
@@ -88,13 +92,22 @@ class FnCallAgent(Agent):
                 if output:
                     yield response + output
             if output:
+                for i, msg in enumerate(output):
+                    if msg.function_call:
+                        logger.info(f'[FnCallAgent]   msg[{i}] function_call={msg.function_call}')
+                    elif msg.content:
+                        logger.info(f'[FnCallAgent]   msg[{i}] content={repr(msg.content)[:500]}')
+                    if msg.reasoning_content:
+                        logger.info(f'[FnCallAgent]   msg[{i}] reasoning={repr(msg.reasoning_content)[:300]}')
                 response.extend(output)
                 messages.extend(output)
                 used_any_tool = False
                 for out in output:
                     use_tool, tool_name, tool_args, _ = self._detect_tool(out)
                     if use_tool:
+                        logger.info(f'[FnCallAgent] Calling tool: {tool_name}, args={repr(tool_args)[:300]}')
                         tool_result = self._call_tool(tool_name, tool_args, messages=messages, **kwargs)
+                        logger.info(f'[FnCallAgent] Tool result: {repr(tool_result)[:500]}')
                         fn_msg = Message(role=FUNCTION,
                                          name=tool_name,
                                          content=tool_result,
@@ -104,7 +117,10 @@ class FnCallAgent(Agent):
                         yield response
                         used_any_tool = True
                 if not used_any_tool:
+                    logger.info('[FnCallAgent] No tool used, breaking loop.')
                     break
+            else:
+                logger.warning('[FnCallAgent] LLM returned empty output!')
         yield response
 
     def _call_tool(self, tool_name: str, tool_args: Union[str, dict] = '{}', **kwargs) -> str:
