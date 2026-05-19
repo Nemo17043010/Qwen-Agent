@@ -16,7 +16,7 @@ import copy
 import logging
 import os
 from pprint import pformat
-from typing import Dict, Iterator, List, Optional
+from typing import Dict, Iterator, List, Literal, Optional, Union
 
 import openai
 
@@ -27,7 +27,7 @@ if openai.__version__.startswith('0.'):
 else:
     from openai import OpenAIError
 
-from qwen_agent.llm.base import ModelServiceError, register_llm
+from qwen_agent.llm.base import BaseChatModel, ModelServiceError, register_llm
 from qwen_agent.llm.function_calling import BaseFnCallModel
 from qwen_agent.llm.schema import ASSISTANT, FunctionCall, Message
 from qwen_agent.log import logger
@@ -95,6 +95,52 @@ class TextChatAtOAI(BaseFnCallModel):
             self._complete_create = _complete_create
             self._chat_complete_create = _chat_complete_create
 
+    def _chat_with_functions(
+        self,
+        messages: List[Message],
+        functions: List[Dict],
+        stream: bool,
+        delta_stream: bool,
+        generate_cfg: dict,
+        lang: Literal['en', 'zh'],
+    ) -> Union[List[Message], Iterator[List[Message]]]:
+        """Use native OpenAI-compatible tool calling instead of prompt-based function calling.
+
+        This bypasses BaseFnCallModel's prompt-based approach and sends tools directly to the API.
+        The native tool_calls in the response are already in function_call format,
+        so we mark them to skip prompt-based postprocessing.
+        """
+        if delta_stream:
+            raise NotImplementedError('delta_stream=True is not supported for function calling.')
+        generate_cfg = copy.deepcopy(generate_cfg)
+        for k in ['parallel_function_calls', 'function_choice', 'thought_in_content']:
+            if k in generate_cfg:
+                del generate_cfg[k]
+        # Convert functions to OpenAI tools format and pass directly to API
+        tools = [{'type': 'function', 'function': f} for f in functions]
+        generate_cfg['tools'] = tools
+        # Set flag to skip prompt-based postprocessing
+        self._native_tool_calling = True
+        return self._chat(messages, stream=stream, delta_stream=False, generate_cfg=generate_cfg)
+
+    def _postprocess_messages(self, messages, fncall_mode, generate_cfg):
+        """Skip prompt-based function call postprocessing when using native tool calling.
+
+        If any message already has function_call set (from native tool_calls),
+        skip the prompt-based <tool_call> tag parsing.
+        """
+        if getattr(self, '_native_tool_calling', False):
+            return BaseChatModel._postprocess_messages(self, messages, fncall_mode=False, generate_cfg=generate_cfg)
+        return super()._postprocess_messages(messages, fncall_mode=fncall_mode, generate_cfg=generate_cfg)
+
+    def _preprocess_messages(self, messages, lang, generate_cfg, functions=None, use_raw_api=False):
+        """Skip prompt-based function call preprocessing when using native tool calling."""
+        if getattr(self, '_native_tool_calling', False):
+            return BaseChatModel._preprocess_messages(self, messages, lang=lang, generate_cfg=generate_cfg,
+                                                      functions=functions)
+        return super()._preprocess_messages(messages, lang=lang, generate_cfg=generate_cfg,
+                                            functions=functions, use_raw_api=use_raw_api)
+
     def _chat_stream(
         self,
         messages: List[Message],
@@ -108,24 +154,26 @@ class TextChatAtOAI(BaseFnCallModel):
             if delta_stream:
                 for chunk in response:
                     if chunk.choices:
-                        if hasattr(chunk.choices[0].delta,
-                                   'reasoning_content') and chunk.choices[0].delta.reasoning_content:
+                        delta = chunk.choices[0].delta
+                        reasoning_text = getattr(delta, 'reasoning_content', None) or getattr(delta, 'reasoning', None)
+                        if reasoning_text:
                             yield [
                                 Message(role=ASSISTANT,
                                         content='',
-                                        reasoning_content=chunk.choices[0].delta.reasoning_content)
+                                        reasoning_content=reasoning_text)
                             ]
-                        if hasattr(chunk.choices[0].delta, 'content') and chunk.choices[0].delta.content:
-                            yield [Message(role=ASSISTANT, content=chunk.choices[0].delta.content)]
+                        if hasattr(delta, 'content') and delta.content:
+                            yield [Message(role=ASSISTANT, content=delta.content)]
             else:
                 full_response = ''
                 full_reasoning_content = ''
                 full_tool_calls = []
                 for chunk in response:
                     if chunk.choices:
-                        if hasattr(chunk.choices[0].delta,
-                                   'reasoning_content') and chunk.choices[0].delta.reasoning_content:
-                            full_reasoning_content += chunk.choices[0].delta.reasoning_content
+                        delta = chunk.choices[0].delta
+                        reasoning_text = getattr(delta, 'reasoning_content', None) or getattr(delta, 'reasoning', None)
+                        if reasoning_text:
+                            full_reasoning_content += reasoning_text
                         if hasattr(chunk.choices[0].delta, 'content') and chunk.choices[0].delta.content:
                             full_response += chunk.choices[0].delta.content
                         if hasattr(chunk.choices[0].delta, 'tool_calls') and chunk.choices[0].delta.tool_calls:
@@ -155,6 +203,11 @@ class TextChatAtOAI(BaseFnCallModel):
                         if full_tool_calls:
                             res += full_tool_calls
                         yield res
+                logger.info(f'[OAI stream] finished: '
+                            f'response_len={len(full_response)}, '
+                            f'reasoning_len={len(full_reasoning_content)}, '
+                            f'tool_calls={len(full_tool_calls)}, '
+                            f'response_preview={repr(full_response[:200])}')
         except OpenAIError as ex:
             raise ModelServiceError(exception=ex)
 
